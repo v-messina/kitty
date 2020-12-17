@@ -44,12 +44,8 @@
 #include "static_truth_table.hpp"
 #include "traits.hpp"
 
-
-enum Constraint_Type { G_E, L_E, E };   /* G_E >=; L_E <=; E == */
-
 struct Constraint {
-  std::vector<int64_t> weight;
-  Constraint_Type type;
+  std::vector<int64_t> variable_weight;
   int constant; /* the right-hand side constant */
 };
 
@@ -66,11 +62,11 @@ namespace kitty
   where w_i are the weight values and T is the threshold value.
   The linear form of a TF is the vector [w_1, ..., w_n; T].
 
-  \param tt_fstar The truth table
-  \param plf Pointer to a vector that will hold a linear form of `tt_copy` if it is a TF.
-             The linear form has `tt_copy.num_vars()` weight values and the threshold value
+  \param tt The truth table
+  \param plf Pointer to a vector that will hold a linear form of `tt` if it is a TF.
+             The linear form has `tt.num_vars()` weight values and the threshold value
              in the end.
-  \return `true` if `tt_copy` is a TF; `false` if `tt_copy` is a non-TF.
+  \return `true` if `tt` is a TF; `false` if `tt` is a non-TF.
 */
 
 template<typename TT, typename = std::enable_if_t<is_complete_truth_table<TT>::value>>
@@ -123,29 +119,25 @@ bool is_threshold(const TT& tt, std::vector<int64_t>* plf = nullptr )
 
   }
 
+  /* Computing ONSET and OFFSET */
   auto ONSET = get_prime_implicants_morreale( tt_copy );
   auto tt_neg = unary_not( tt_copy );
   auto OFFSET = get_prime_implicants_morreale(tt_neg);
 
   std::vector<Constraint> constraints;
 
+  /* Creating constraints */
   for (auto& cube_i : ONSET){
     Constraint constraint;
     for(uint64_t var_i = 0; var_i < n_var; var_i++){
       if (cube_i.get_mask(var_i) == 1){
-        if(cube_i.get_bit(var_i) == 1){
-          constraint.weight.emplace_back(1);
-        }
-        else{
-          constraint.weight.emplace_back(0);
-        }
+        constraint.variable_weight.emplace_back(cube_i.get_bit(var_i));
       }
       else{
-        constraint.weight.emplace_back(0);
+        constraint.variable_weight.emplace_back(0);
       }
     }
-    constraint.weight.emplace_back(-1);
-    constraint.type = G_E;
+    constraint.variable_weight.emplace_back(-1);
     constraint.constant = 0;
     constraints.emplace_back(constraint);
   }
@@ -153,96 +145,95 @@ bool is_threshold(const TT& tt, std::vector<int64_t>* plf = nullptr )
   for (auto& cube_i : OFFSET){
     Constraint constraint;
     for(uint64_t var_i = 0; var_i < n_var; var_i++){
-      if (cube_i.get_mask(var_i) == 0){
-        constraint.weight.emplace_back(1);
-      }
-      else{
-        constraint.weight.emplace_back(0);
-      }
+      constraint.variable_weight.emplace_back(!cube_i.get_mask(var_i));
     }
-    constraint.weight.emplace_back(-1);
-    constraint.type = L_E;
+    constraint.variable_weight.emplace_back(-1);
     constraint.constant = -1;
     constraints.emplace_back(constraint);
   }
 
-  /*Positive weights*/
+  /* Adding positive variable weights */
   for(uint64_t var_i = 0; var_i <= n_var; var_i++){
     Constraint constraint;
     for(uint64_t i = 0; i <= n_var; i++){
-      constraint.weight.emplace_back(0);
+      if (i == var_i)
+        constraint.variable_weight.emplace_back(1);
+      else
+        constraint.variable_weight.emplace_back(0);
     }
-    constraint.weight[var_i] = 1;
     constraint.constant = 0;
-    constraint.type = G_E;
     constraints.emplace_back(constraint);
   }
 
   /* lp_solve */
   lprec *lp;
   auto n_rows = constraints.size();
-  std::vector<double> row;
+  std::vector<double> rows;
 
-  /* Create a new LP model */
+  /* Creating a new LP model */
   lp = make_lp(0, n_var+1);
   if(lp == nullptr) {
     fprintf(stderr, "Unable to create new LP model\n");
     return(false);
   }
 
+  /* Setting rowmode to pass one row each time */
   set_add_rowmode(lp, TRUE);
 
-  /*the objective function*/
-  row.emplace_back(1.0);
-  for(uint64_t col = 1; col<=n_var+1; col++){
-    row.emplace_back(1.0);
+  for(uint64_t col = 0; col<=n_var+1; col++){
+    rows.emplace_back(1.0);
   }
 
-  set_obj_fn(lp, row.data());
+  /* Setting the objective function */
+  set_obj_fn(lp, rows.data());
 
-  for(uint64_t rows = 0; rows < n_rows; rows++){
+  /* Adding constraints */
+  for(uint64_t row = 0; row < n_rows; row++){
     for(uint64_t col = 1; col <= n_var+1; col++){
-      row[col] = constraints[rows].weight[col-1];
+      rows[col] = constraints[row].variable_weight[col-1];
     }
-    if(constraints[rows].type == G_E)
-      add_constraint(lp, row.data(), GE, constraints[rows].constant);
-    else if (constraints[rows].type == L_E)
-      add_constraint(lp, row.data(), LE, constraints[rows].constant);
+    if(constraints[row].constant == 0)
+      add_constraint(lp, rows.data(), GE, constraints[row].constant);
+    else if (constraints[row].constant == -1)
+      add_constraint(lp, rows.data(), LE, constraints[row].constant);
   }
 
   set_add_rowmode(lp, FALSE);
+  /* Minimizing mode */
   set_minim(lp);
   print_lp(lp);
   set_verbose(lp, IMPORTANT);
 
-  for(auto i = 1u; i< n_var+1; i++){
+  for(auto i = 1u; i < n_var+1; i++){
     set_int(lp, i, TRUE);
   }
 
+  /* Solving the LP */
   int ret = solve(lp);
-  if(ret == OPTIMAL){    //tt_copy is TF
-    /* objective value */
+  /* if OPTIMAL means that tt_copy is a TF */
+  if(ret == OPTIMAL){
     printf("Objective value: %f\n", get_objective(lp));
 
-    /* variable values */
-    get_variables(lp, row.data());
+    /* Getting weights found */
+    get_variables(lp, rows.data());
 
-    int threshold = row[n_var];
+    /* Getting threshold found */
+    int T = rows[n_var];
 
+    /* Setting weights and threshold considering the negated variables */
     for(uint64_t i = 0; i < n_var; i++){
-      if( neg_var[i] )
-      {
-        linear_form.emplace_back(-row[i]);
-        threshold = threshold - row[i];
+      if( neg_var[i] ){
+        linear_form.emplace_back(-rows[i]);
+        T = T - rows[i];
       }
       else
-        linear_form.emplace_back(row[i]);
+        linear_form.emplace_back(rows[i]);
     }
-    linear_form.emplace_back(threshold);
+    linear_form.emplace_back( T );
 
-    /*print values*/
+    /* Printing values */
     for(uint64_t j = 0; j <= n_var +1; j++){
-      printf( "%s: %f\n", get_col_name( lp, j + 1 ), row[j] );
+      printf( "%s: %f\n", get_col_name( lp, j + 1 ), rows[j] );
     }
   }
   else
